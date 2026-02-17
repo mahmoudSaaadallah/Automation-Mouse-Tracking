@@ -142,6 +142,7 @@ class MouseRecorderApp:
         self.mouse_listener = None
         self.keyboard_listener = None
         self.mouse_controller = mouse.Controller()
+        self.keyboard_controller = keyboard.Controller()
         self.wheel_hook = None
         self.last_scroll_time = 0.0
         self.last_scroll_signature = None
@@ -152,7 +153,6 @@ class MouseRecorderApp:
         self._build_ui()
         self._load_last_recording()
         self._set_recording_ui(False)
-        self._start_keyboard_listener()
 
     def _build_ui(self) -> None:
         wrapper = tk.Frame(self.root, padx=18, pady=18)
@@ -224,12 +224,44 @@ class MouseRecorderApp:
         return time.perf_counter() - self.record_start_time
 
     def _event_type_counts(self):
-        counts = {"move": 0, "click": 0, "scroll": 0}
+        counts = {"move": 0, "click": 0, "scroll": 0, "key": 0}
         for event in self.events:
             event_type = event.get("type")
             if event_type in counts:
                 counts[event_type] += 1
         return counts
+
+    def _serialize_key(self, key):
+        if isinstance(key, keyboard.Key):
+            return {"kind": "special", "value": key.name}
+        if isinstance(key, keyboard.KeyCode):
+            if key.char is not None:
+                return {"kind": "char", "value": key.char}
+            if key.vk is not None:
+                return {"kind": "vk", "value": int(key.vk)}
+        return {"kind": "text", "value": str(key)}
+
+    def _deserialize_key(self, payload):
+        if not isinstance(payload, dict):
+            return None
+
+        kind = payload.get("kind")
+        value = payload.get("value")
+        if kind == "special" and isinstance(value, str):
+            return getattr(keyboard.Key, value, None)
+        if kind == "char" and isinstance(value, str) and value != "":
+            try:
+                return keyboard.KeyCode.from_char(value)
+            except (TypeError, ValueError):
+                return None
+        if kind == "vk":
+            try:
+                return keyboard.KeyCode.from_vk(int(value))
+            except (TypeError, ValueError):
+                return None
+        if kind == "text" and isinstance(value, str) and value.startswith("Key."):
+            return getattr(keyboard.Key, value.split("Key.", 1)[1], None)
+        return None
 
     def _append_move_event(
         self,
@@ -278,6 +310,26 @@ class MouseRecorderApp:
             }
         )
 
+    def _append_key_event(self, key, action: str) -> None:
+        if not self.is_recording:
+            return
+
+        # Esc is reserved for stopping recording and is not recorded.
+        if key == keyboard.Key.esc:
+            if action == "press":
+                self.root.after(0, self.stop_recording)
+            return
+
+        payload = self._serialize_key(key)
+        self.events.append(
+            {
+                "type": "key",
+                "time": self._timestamp(),
+                "action": action,
+                "key": payload,
+            }
+        )
+
     def _emit_scroll(self, step_x: int, step_y: int) -> None:
         if step_x == 0 and step_y == 0:
             return
@@ -304,15 +356,6 @@ class MouseRecorderApp:
 
         self.mouse_controller.scroll(step_x, step_y)
 
-    def _start_keyboard_listener(self) -> None:
-        def on_press(key):
-            if key == keyboard.Key.esc and self.is_recording:
-                self.root.after(0, self.stop_recording)
-
-        self.keyboard_listener = keyboard.Listener(on_press=on_press)
-        self.keyboard_listener.daemon = True
-        self.keyboard_listener.start()
-
     def start_recording(self) -> None:
         if self.is_recording:
             return
@@ -324,7 +367,7 @@ class MouseRecorderApp:
         self.last_scroll_time = 0.0
         self.last_scroll_signature = None
         self.is_recording = True
-        self.status_var.set("Recording... move/click/scroll then press Esc")
+        self.status_var.set("Recording... mouse + keyboard. Press Esc to stop")
         self._set_recording_ui(True)
 
         start_x, start_y = self.mouse_controller.position
@@ -352,6 +395,12 @@ class MouseRecorderApp:
         def on_scroll(x, y, dx, dy):
             self._append_scroll_event(x, y, dx, dy)
 
+        def on_key_press(key):
+            self._append_key_event(key, "press")
+
+        def on_key_release(key):
+            self._append_key_event(key, "release")
+
         self.mouse_listener = mouse.Listener(
             on_move=on_move,
             on_click=on_click,
@@ -359,6 +408,14 @@ class MouseRecorderApp:
         )
         self.mouse_listener.daemon = True
         self.mouse_listener.start()
+
+        self.keyboard_listener = keyboard.Listener(
+            on_press=on_key_press,
+            on_release=on_key_release,
+        )
+        self.keyboard_listener.daemon = True
+        self.keyboard_listener.start()
+
         if sys.platform == "win32":
             self.wheel_hook = WindowsWheelHook(on_scroll)
             self.wheel_hook.start()
@@ -374,6 +431,9 @@ class MouseRecorderApp:
         if self.mouse_listener:
             self.mouse_listener.stop()
             self.mouse_listener = None
+        if self.keyboard_listener:
+            self.keyboard_listener.stop()
+            self.keyboard_listener = None
         if self.wheel_hook:
             self.wheel_hook.stop()
             self.wheel_hook = None
@@ -388,7 +448,8 @@ class MouseRecorderApp:
             f"Total {len(self.events)} | "
             f"Move {counts['move']} | "
             f"Click {counts['click']} | "
-            f"Scroll {counts['scroll']}"
+            f"Scroll {counts['scroll']} | "
+            f"Key {counts['key']}"
         )
 
     def replay_last_recording(self) -> None:
@@ -410,6 +471,8 @@ class MouseRecorderApp:
             scroll_x_remainder = 0.0
             scroll_y_remainder = 0.0
             replay_scroll_events = 0
+            replay_key_events = 0
+            pressed_keys = []
             for event in replay_events:
                 target_time = float(event.get("time", 0.0))
                 while True:
@@ -441,6 +504,20 @@ class MouseRecorderApp:
                         self._emit_scroll(scroll_x, scroll_y)
                         scroll_x_remainder -= scroll_x
                         scroll_y_remainder -= scroll_y
+                elif etype == "key":
+                    key_obj = self._deserialize_key(event.get("key"))
+                    action = event.get("action")
+                    if key_obj and action in ("press", "release"):
+                        replay_key_events += 1
+                        if action == "press":
+                            self.keyboard_controller.press(key_obj)
+                            pressed_keys.append(key_obj)
+                        else:
+                            self.keyboard_controller.release(key_obj)
+                            for idx in range(len(pressed_keys) - 1, -1, -1):
+                                if pressed_keys[idx] == key_obj:
+                                    pressed_keys.pop(idx)
+                                    break
 
             # Flush residual fractional scroll at end so tiny touchpad deltas
             # still produce a final visible scroll step.
@@ -449,18 +526,32 @@ class MouseRecorderApp:
             if final_x != 0 or final_y != 0:
                 self._emit_scroll(final_x, final_y)
 
+            # Safety release for any keys that remained pressed in the timeline.
+            for key_obj in reversed(pressed_keys):
+                try:
+                    self.keyboard_controller.release(key_obj)
+                except Exception:
+                    pass
+
             if replay_events:
                 last = replay_events[-1]
                 if "x" in last and "y" in last:
                     self.mouse_controller.position = (int(last["x"]), int(last["y"]))
 
-            self.root.after(0, lambda: self._on_replay_done(replay_scroll_events))
+            self.root.after(
+                0,
+                lambda: self._on_replay_done(replay_scroll_events, replay_key_events),
+            )
 
         threading.Thread(target=run_replay, daemon=True).start()
 
-    def _on_replay_done(self, replay_scroll_events: int = 0) -> None:
+    def _on_replay_done(self, replay_scroll_events: int = 0, replay_key_events: int = 0) -> None:
         self._set_recording_ui(False)
-        self.status_var.set(f"Replay finished | Scroll events replayed: {replay_scroll_events}")
+        self.status_var.set(
+            "Replay finished | "
+            f"Scroll replayed: {replay_scroll_events} | "
+            f"Keys replayed: {replay_key_events}"
+        )
 
     def _save_last_recording(self) -> None:
         try:
