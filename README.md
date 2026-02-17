@@ -37,8 +37,10 @@ After build, send/share only:
 4. Set `Replay Count` to the number of loops you want.
 5. Keep `Smart Replay` enabled for safer replay (recommended).
 6. Set `Wait (s)` to how long replay should wait for the expected app/window before each key/click/scroll event.
-7. Click `Replay Last Recording` to run the same mouse + keyboard actions automatically.
-8. Press `Esc` during replay to stop replay immediately.
+7. Keep `Click Pixel Guard` enabled to verify click target color before every click (recommended for web waits).
+8. Set `Tolerance` to control how strict pixel matching should be (start with `28`).
+9. Click `Replay Last Recording` to run the same mouse + keyboard actions automatically.
+10. Press `Esc` during replay to stop replay immediately.
 
 ## Notes
 
@@ -46,3 +48,5 @@ After build, send/share only:
 - The last saved recording is loaded automatically on startup.
 - During replay, the app controls both mouse and keyboard according to the recorded events.
 - In `Smart Replay`, every key/click/scroll event waits for matching window context (title/class) before executing.
+- `Click Pixel Guard` waits for a close RGB match at click coordinates before pressing.
+- Replay diagnostics are saved in `%LOCALAPPDATA%\MouseTrackerReplay\replay_debug.log`.

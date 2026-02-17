@@ -68,6 +68,27 @@ def get_foreground_window_context():
     }
 
 
+def get_screen_pixel_rgb(x: int, y: int):
+    if sys.platform != "win32":
+        return None
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    hdc = user32.GetDC(0)
+    if not hdc:
+        return None
+    try:
+        color_ref = gdi32.GetPixel(hdc, int(x), int(y))
+        if color_ref == -1:
+            return None
+        red = color_ref & 0xFF
+        green = (color_ref >> 8) & 0xFF
+        blue = (color_ref >> 16) & 0xFF
+        return (int(red), int(green), int(blue))
+    finally:
+        user32.ReleaseDC(0, hdc)
+
+
 if sys.platform == "win32":
     ULONG_PTR_TYPE = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
     LRESULT_TYPE = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
@@ -167,7 +188,7 @@ class MouseRecorderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Mouse Recorder")
-        self.root.geometry("420x360")
+        self.root.geometry("420x430")
         self.root.resizable(False, False)
 
         self.is_recording = False
@@ -189,9 +210,12 @@ class MouseRecorderApp:
         self.last_scroll_signature = None
         self.app_data_dir = get_app_data_dir()
         self.recording_file = self.app_data_dir / "last_recording.json"
+        self.replay_log_file = self.app_data_dir / "replay_debug.log"
         self.replay_count_var = tk.StringVar(value="1")
         self.smart_replay_var = tk.BooleanVar(value=True)
         self.smart_wait_timeout_var = tk.StringVar(value="8")
+        self.click_pixel_guard_var = tk.BooleanVar(value=True)
+        self.click_pixel_tolerance_var = tk.StringVar(value="28")
 
         self.status_var = tk.StringVar(value="Ready")
 
@@ -285,6 +309,34 @@ class MouseRecorderApp:
         )
         self.smart_wait_spinbox.pack(side="left")
 
+        pixel_row = tk.Frame(wrapper)
+        pixel_row.pack(pady=(2, 8))
+        self.click_pixel_guard_check = tk.Checkbutton(
+            pixel_row,
+            text="Click Pixel Guard",
+            variable=self.click_pixel_guard_var,
+            onvalue=True,
+            offvalue=False,
+            font=("Segoe UI", 10),
+        )
+        self.click_pixel_guard_check.pack(side="left", padx=(0, 12))
+        pixel_tol_label = tk.Label(
+            pixel_row,
+            text="Tolerance:",
+            font=("Segoe UI", 10),
+        )
+        pixel_tol_label.pack(side="left", padx=(0, 6))
+        self.click_pixel_tolerance_spinbox = tk.Spinbox(
+            pixel_row,
+            from_=1,
+            to=255,
+            width=6,
+            textvariable=self.click_pixel_tolerance_var,
+            justify="center",
+            font=("Segoe UI", 10),
+        )
+        self.click_pixel_tolerance_spinbox.pack(side="left")
+
         status_label = tk.Label(
             wrapper,
             textvariable=self.status_var,
@@ -312,6 +364,8 @@ class MouseRecorderApp:
             self.replay_count_spinbox.config(state="disabled")
             self.smart_replay_check.config(state="disabled")
             self.smart_wait_spinbox.config(state="disabled")
+            self.click_pixel_guard_check.config(state="disabled")
+            self.click_pixel_tolerance_spinbox.config(state="disabled")
         else:
             self.start_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
@@ -320,6 +374,8 @@ class MouseRecorderApp:
                 self.replay_count_spinbox.config(state="normal")
                 self.smart_replay_check.config(state="normal")
                 self.smart_wait_spinbox.config(state="normal")
+                self.click_pixel_guard_check.config(state="normal")
+                self.click_pixel_tolerance_spinbox.config(state="normal")
 
     def _timestamp(self) -> float:
         return time.perf_counter() - self.record_start_time
@@ -378,6 +434,87 @@ class MouseRecorderApp:
         timeout_seconds = min(timeout_seconds, 120.0)
         self.smart_wait_timeout_var.set(str(timeout_seconds).rstrip("0").rstrip("."))
         return timeout_seconds
+
+    def _click_pixel_guard_enabled(self) -> bool:
+        return bool(self.click_pixel_guard_var.get()) and sys.platform == "win32"
+
+    def _get_click_pixel_tolerance(self):
+        raw = self.click_pixel_tolerance_var.get().strip()
+        try:
+            tolerance = int(raw)
+        except ValueError:
+            messagebox.showerror("Invalid Pixel Tolerance", "Tolerance must be a whole number.")
+            return None
+
+        if tolerance < 1:
+            messagebox.showerror("Invalid Pixel Tolerance", "Tolerance must be at least 1.")
+            return None
+
+        tolerance = min(tolerance, 255)
+        self.click_pixel_tolerance_var.set(str(tolerance))
+        return tolerance
+
+    def _attach_click_pixel_context(self, event: dict) -> dict:
+        if sys.platform != "win32":
+            return event
+        if event.get("type") != "click" or not event.get("pressed"):
+            return event
+        x = int(event.get("x", 0))
+        y = int(event.get("y", 0))
+        color = get_screen_pixel_rgb(x, y)
+        if color is None:
+            return event
+        event["pixel"] = {"r": color[0], "g": color[1], "b": color[2]}
+        return event
+
+    def _wait_for_click_pixel_context(
+        self,
+        event: dict,
+        timeout_seconds: float,
+        pixel_guard_enabled: bool,
+        tolerance: int,
+    ):
+        if not pixel_guard_enabled:
+            return True, ""
+        if event.get("type") != "click" or not event.get("pressed"):
+            return True, ""
+
+        expected_pixel = event.get("pixel")
+        if not isinstance(expected_pixel, dict):
+            return True, ""
+
+        x = int(event.get("x", 0))
+        y = int(event.get("y", 0))
+        target_r = int(expected_pixel.get("r", 0))
+        target_g = int(expected_pixel.get("g", 0))
+        target_b = int(expected_pixel.get("b", 0))
+
+        started_at = time.perf_counter()
+        while True:
+            if self._should_stop_replay():
+                return False, "Stopped by Esc"
+
+            current = get_screen_pixel_rgb(x, y)
+            if current is not None:
+                dr = abs(current[0] - target_r)
+                dg = abs(current[1] - target_g)
+                db = abs(current[2] - target_b)
+                if dr <= tolerance and dg <= tolerance and db <= tolerance:
+                    return True, ""
+
+            if (time.perf_counter() - started_at) >= timeout_seconds:
+                return False, f"Pixel guard timeout at ({x},{y})"
+
+            time.sleep(0.03)
+
+    def _log_replay(self, message: str) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {message}\n"
+        try:
+            with self.replay_log_file.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        except OSError:
+            pass
 
     def _wait_for_event_window_context(
         self,
@@ -622,6 +759,7 @@ class MouseRecorderApp:
                 "button": button.name,
                 "pressed": bool(pressed),
             }
+            self._attach_click_pixel_context(event)
             self.events.append(self._attach_window_context(event))
 
         def on_scroll(x, y, dx, dy):
@@ -702,6 +840,12 @@ class MouseRecorderApp:
             smart_wait_timeout = self._get_smart_wait_timeout()
             if smart_wait_timeout is None:
                 return
+        click_pixel_guard_enabled = self._click_pixel_guard_enabled()
+        click_pixel_tolerance = 0
+        if click_pixel_guard_enabled:
+            click_pixel_tolerance = self._get_click_pixel_tolerance()
+            if click_pixel_tolerance is None:
+                return
 
         self.is_replaying = True
         self.stop_replay_requested.clear()
@@ -711,7 +855,15 @@ class MouseRecorderApp:
         self.replay_count_spinbox.config(state="disabled")
         self.smart_replay_check.config(state="disabled")
         self.smart_wait_spinbox.config(state="disabled")
+        self.click_pixel_guard_check.config(state="disabled")
+        self.click_pixel_tolerance_spinbox.config(state="disabled")
         self.status_var.set(f"Replaying 1/{replay_count}... Press Esc to stop")
+        self._log_replay(
+            "Replay started "
+            f"(loops={replay_count}, smart={smart_replay_enabled}, "
+            f"smart_wait={smart_wait_timeout}, pixel_guard={click_pixel_guard_enabled}, "
+            f"pixel_tol={click_pixel_tolerance})"
+        )
 
         def run_replay():
             replay_events = sorted(self.events, key=lambda item: float(item.get("time", 0.0)))
@@ -724,6 +876,7 @@ class MouseRecorderApp:
             for loop_idx in range(replay_count):
                 if self._should_stop_replay():
                     replay_stopped = True
+                    replay_stop_reason = "Stopped by Esc"
                     break
 
                 replay_start = time.perf_counter()
@@ -737,12 +890,14 @@ class MouseRecorderApp:
                 for event in replay_events:
                     if self._should_stop_replay():
                         replay_stopped = True
+                        replay_stop_reason = "Stopped by Esc"
                         break
 
                     target_time = float(event.get("time", 0.0))
                     while True:
                         if self._should_stop_replay():
                             replay_stopped = True
+                            replay_stop_reason = "Stopped by Esc"
                             break
                         elapsed = time.perf_counter() - replay_start
                         remaining = target_time - elapsed
@@ -758,6 +913,17 @@ class MouseRecorderApp:
                             event,
                             smart_wait_timeout,
                             smart_replay_enabled,
+                        )
+                        if not ready:
+                            replay_stopped = True
+                            replay_stop_reason = reason
+                            break
+                    if etype == "click":
+                        ready, reason = self._wait_for_click_pixel_context(
+                            event,
+                            smart_wait_timeout,
+                            click_pixel_guard_enabled,
+                            click_pixel_tolerance,
                         )
                         if not ready:
                             replay_stopped = True
@@ -874,6 +1040,12 @@ class MouseRecorderApp:
         self._set_recording_ui(False)
         if replay_stopped:
             reason_suffix = f" | Reason: {replay_stop_reason}" if replay_stop_reason else ""
+            self._log_replay(
+                "Replay stopped "
+                f"(loops={completed_loops}/{replay_count}, "
+                f"scroll={replay_scroll_events}, keys={replay_key_events}, "
+                f"reason={replay_stop_reason or 'unknown'})"
+            )
             self.status_var.set(
                 "Replay stopped | "
                 f"Loops: {completed_loops}/{replay_count} | "
@@ -882,6 +1054,11 @@ class MouseRecorderApp:
                 f"{reason_suffix}"
             )
             return
+        self._log_replay(
+            "Replay finished "
+            f"(loops={completed_loops}/{replay_count}, "
+            f"scroll={replay_scroll_events}, keys={replay_key_events})"
+        )
         self.status_var.set(
             "Replay finished | "
             f"Loops: {completed_loops}/{replay_count} | "
