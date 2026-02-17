@@ -24,8 +24,9 @@ python main.py
 1. Click `Start Recording`.
 2. Move the mouse, click/scroll, and use the keyboard.
 3. Press `Esc` to stop recording.
-4. Click `Replay Last Recording` to run the same mouse + keyboard actions automatically.
-5. Press `Esc` during replay to stop replay immediately.
+4. Set `Replay Count` to the number of loops you want.
+5. Click `Replay Last Recording` to run the same mouse + keyboard actions automatically.
+6. Press `Esc` during replay to stop replay immediately.
 
 ## Notes
 

@@ -130,7 +130,7 @@ class MouseRecorderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Mouse Recorder")
-        self.root.geometry("420x250")
+        self.root.geometry("420x300")
         self.root.resizable(False, False)
 
         self.is_recording = False
@@ -151,6 +151,7 @@ class MouseRecorderApp:
         self.last_scroll_time = 0.0
         self.last_scroll_signature = None
         self.recording_file = Path(__file__).with_name("last_recording.json")
+        self.replay_count_var = tk.StringVar(value="1")
 
         self.status_var = tk.StringVar(value="Ready")
 
@@ -197,6 +198,25 @@ class MouseRecorderApp:
         )
         self.replay_btn.pack(pady=4)
 
+        replay_count_row = tk.Frame(wrapper)
+        replay_count_row.pack(pady=(6, 2))
+        replay_count_label = tk.Label(
+            replay_count_row,
+            text="Replay Count:",
+            font=("Segoe UI", 10),
+        )
+        replay_count_label.pack(side="left", padx=(0, 8))
+        self.replay_count_spinbox = tk.Spinbox(
+            replay_count_row,
+            from_=1,
+            to=9999,
+            width=8,
+            textvariable=self.replay_count_var,
+            justify="center",
+            font=("Segoe UI", 10),
+        )
+        self.replay_count_spinbox.pack(side="left")
+
         status_label = tk.Label(
             wrapper,
             textvariable=self.status_var,
@@ -221,10 +241,13 @@ class MouseRecorderApp:
             self.start_btn.config(state="disabled")
             self.stop_btn.config(state="normal")
             self.replay_btn.config(state="disabled")
+            self.replay_count_spinbox.config(state="disabled")
         else:
             self.start_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
             self.replay_btn.config(state="normal")
+            if not self.is_replaying:
+                self.replay_count_spinbox.config(state="normal")
 
     def _timestamp(self) -> float:
         return time.perf_counter() - self.record_start_time
@@ -396,6 +419,21 @@ class MouseRecorderApp:
             return True
         return self._is_escape_pressed_now()
 
+    def _get_replay_count(self):
+        raw_value = self.replay_count_var.get().strip()
+        try:
+            replay_count = int(raw_value)
+        except ValueError:
+            messagebox.showerror("Invalid Replay Count", "Replay count must be a whole number.")
+            return None
+
+        if replay_count < 1:
+            messagebox.showerror("Invalid Replay Count", "Replay count must be at least 1.")
+            return None
+
+        self.replay_count_var.set(str(replay_count))
+        return replay_count
+
     def start_recording(self) -> None:
         if self.is_recording or self.is_replaying:
             return
@@ -501,109 +539,139 @@ class MouseRecorderApp:
         if not self.events:
             messagebox.showinfo("No Data", "No recorded data to replay.")
             return
+        replay_count = self._get_replay_count()
+        if replay_count is None:
+            return
 
         self.is_replaying = True
         self.stop_replay_requested.clear()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
-        self.status_var.set("Replaying... Press Esc to stop")
+        self.replay_count_spinbox.config(state="disabled")
+        self.status_var.set(f"Replaying 1/{replay_count}... Press Esc to stop")
 
         def run_replay():
             replay_events = sorted(self.events, key=lambda item: float(item.get("time", 0.0)))
-            replay_start = time.perf_counter()
-            scroll_x_remainder = 0.0
-            scroll_y_remainder = 0.0
+            replay_stopped = False
             replay_scroll_events = 0
             replay_key_events = 0
-            replay_stopped = False
-            pressed_keys = []
-            pressed_buttons = []
-            for event in replay_events:
+            completed_loops = 0
+
+            for loop_idx in range(replay_count):
                 if self._should_stop_replay():
                     replay_stopped = True
                     break
 
-                target_time = float(event.get("time", 0.0))
-                while True:
+                replay_start = time.perf_counter()
+                scroll_x_remainder = 0.0
+                scroll_y_remainder = 0.0
+                pressed_keys = []
+                pressed_buttons = []
+                loop_scroll_events = 0
+                loop_key_events = 0
+
+                for event in replay_events:
                     if self._should_stop_replay():
                         replay_stopped = True
                         break
-                    elapsed = time.perf_counter() - replay_start
-                    remaining = target_time - elapsed
-                    if remaining <= 0:
+
+                    target_time = float(event.get("time", 0.0))
+                    while True:
+                        if self._should_stop_replay():
+                            replay_stopped = True
+                            break
+                        elapsed = time.perf_counter() - replay_start
+                        remaining = target_time - elapsed
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(remaining, 0.002))
+                    if replay_stopped:
                         break
-                    time.sleep(min(remaining, 0.002))
+
+                    etype = event.get("type")
+                    if etype == "move":
+                        self.mouse_controller.position = (int(event["x"]), int(event["y"]))
+                    elif etype == "click":
+                        self.mouse_controller.position = (int(event["x"]), int(event["y"]))
+                        btn = getattr(mouse.Button, event["button"], None)
+                        if btn:
+                            if event["pressed"]:
+                                self.mouse_controller.press(btn)
+                                pressed_buttons.append(btn)
+                            else:
+                                self.mouse_controller.release(btn)
+                                for idx in range(len(pressed_buttons) - 1, -1, -1):
+                                    if pressed_buttons[idx] == btn:
+                                        pressed_buttons.pop(idx)
+                                        break
+                    elif etype == "scroll":
+                        loop_scroll_events += 1
+                        self.mouse_controller.position = (int(event["x"]), int(event["y"]))
+                        scroll_x_remainder += float(event.get("dx", 0.0))
+                        scroll_y_remainder += float(event.get("dy", 0.0))
+                        scroll_x = math.trunc(scroll_x_remainder)
+                        scroll_y = math.trunc(scroll_y_remainder)
+                        if scroll_x != 0 or scroll_y != 0:
+                            self._emit_scroll(scroll_x, scroll_y)
+                            scroll_x_remainder -= scroll_x
+                            scroll_y_remainder -= scroll_y
+                    elif etype == "key":
+                        key_obj = self._deserialize_key(event.get("key"))
+                        action = event.get("action")
+                        if key_obj and action in ("press", "release"):
+                            loop_key_events += 1
+                            if action == "press":
+                                self.keyboard_controller.press(key_obj)
+                                pressed_keys.append(key_obj)
+                            else:
+                                self.keyboard_controller.release(key_obj)
+                                for idx in range(len(pressed_keys) - 1, -1, -1):
+                                    if pressed_keys[idx] == key_obj:
+                                        pressed_keys.pop(idx)
+                                        break
+
+                if not replay_stopped:
+                    # Flush residual fractional scroll at end so tiny touchpad deltas
+                    # still produce a final visible scroll step.
+                    final_x = int(round(scroll_x_remainder))
+                    final_y = int(round(scroll_y_remainder))
+                    if final_x != 0 or final_y != 0:
+                        self._emit_scroll(final_x, final_y)
+
+                # Safety release for any keys/buttons that remained pressed.
+                for key_obj in reversed(pressed_keys):
+                    try:
+                        self.keyboard_controller.release(key_obj)
+                    except Exception:
+                        pass
+
+                for btn in reversed(pressed_buttons):
+                    try:
+                        self.mouse_controller.release(btn)
+                    except Exception:
+                        pass
+
+                replay_scroll_events += loop_scroll_events
+                replay_key_events += loop_key_events
+
+                if replay_events and not replay_stopped:
+                    last = replay_events[-1]
+                    if "x" in last and "y" in last:
+                        self.mouse_controller.position = (int(last["x"]), int(last["y"]))
+
                 if replay_stopped:
                     break
 
-                etype = event.get("type")
-                if etype == "move":
-                    self.mouse_controller.position = (int(event["x"]), int(event["y"]))
-                elif etype == "click":
-                    self.mouse_controller.position = (int(event["x"]), int(event["y"]))
-                    btn = getattr(mouse.Button, event["button"], None)
-                    if btn:
-                        if event["pressed"]:
-                            self.mouse_controller.press(btn)
-                            pressed_buttons.append(btn)
-                        else:
-                            self.mouse_controller.release(btn)
-                            for idx in range(len(pressed_buttons) - 1, -1, -1):
-                                if pressed_buttons[idx] == btn:
-                                    pressed_buttons.pop(idx)
-                                    break
-                elif etype == "scroll":
-                    replay_scroll_events += 1
-                    self.mouse_controller.position = (int(event["x"]), int(event["y"]))
-                    scroll_x_remainder += float(event.get("dx", 0.0))
-                    scroll_y_remainder += float(event.get("dy", 0.0))
-                    scroll_x = math.trunc(scroll_x_remainder)
-                    scroll_y = math.trunc(scroll_y_remainder)
-                    if scroll_x != 0 or scroll_y != 0:
-                        self._emit_scroll(scroll_x, scroll_y)
-                        scroll_x_remainder -= scroll_x
-                        scroll_y_remainder -= scroll_y
-                elif etype == "key":
-                    key_obj = self._deserialize_key(event.get("key"))
-                    action = event.get("action")
-                    if key_obj and action in ("press", "release"):
-                        replay_key_events += 1
-                        if action == "press":
-                            self.keyboard_controller.press(key_obj)
-                            pressed_keys.append(key_obj)
-                        else:
-                            self.keyboard_controller.release(key_obj)
-                            for idx in range(len(pressed_keys) - 1, -1, -1):
-                                if pressed_keys[idx] == key_obj:
-                                    pressed_keys.pop(idx)
-                                    break
-
-            if not replay_stopped:
-                # Flush residual fractional scroll at end so tiny touchpad deltas
-                # still produce a final visible scroll step.
-                final_x = int(round(scroll_x_remainder))
-                final_y = int(round(scroll_y_remainder))
-                if final_x != 0 or final_y != 0:
-                    self._emit_scroll(final_x, final_y)
-
-            # Safety release for any keys that remained pressed in the timeline.
-            for key_obj in reversed(pressed_keys):
-                try:
-                    self.keyboard_controller.release(key_obj)
-                except Exception:
-                    pass
-
-            for btn in reversed(pressed_buttons):
-                try:
-                    self.mouse_controller.release(btn)
-                except Exception:
-                    pass
-
-            if replay_events and not replay_stopped:
-                last = replay_events[-1]
-                if "x" in last and "y" in last:
-                    self.mouse_controller.position = (int(last["x"]), int(last["y"]))
+                completed_loops += 1
+                if completed_loops < replay_count:
+                    next_loop = completed_loops + 1
+                    self.root.after(
+                        0,
+                        lambda n=next_loop: self.status_var.set(
+                            f"Replaying {n}/{replay_count}... Press Esc to stop"
+                        ),
+                    )
 
             self.root.after(
                 0,
@@ -611,6 +679,8 @@ class MouseRecorderApp:
                     replay_scroll_events,
                     replay_key_events,
                     replay_stopped,
+                    completed_loops,
+                    replay_count,
                 ),
             )
 
@@ -621,18 +691,22 @@ class MouseRecorderApp:
         replay_scroll_events: int = 0,
         replay_key_events: int = 0,
         replay_stopped: bool = False,
+        completed_loops: int = 0,
+        replay_count: int = 1,
     ) -> None:
         self.is_replaying = False
         self._set_recording_ui(False)
         if replay_stopped:
             self.status_var.set(
                 "Replay stopped by Esc | "
+                f"Loops: {completed_loops}/{replay_count} | "
                 f"Scroll replayed: {replay_scroll_events} | "
                 f"Keys replayed: {replay_key_events}"
             )
             return
         self.status_var.set(
             "Replay finished | "
+            f"Loops: {completed_loops}/{replay_count} | "
             f"Scroll replayed: {replay_scroll_events} | "
             f"Keys replayed: {replay_key_events}"
         )
