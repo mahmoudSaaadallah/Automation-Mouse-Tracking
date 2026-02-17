@@ -31,6 +31,43 @@ def enable_windows_dpi_awareness() -> None:
             pass
 
 
+def get_app_data_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path.home()
+        local_app_data = Path(base, "AppData", "Local")
+        if local_app_data.exists():
+            base = local_app_data
+        app_dir = base / "MouseTrackerReplay"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        return app_dir
+
+    app_dir = Path.home() / ".mouse-tracker-replay"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir
+
+
+def get_foreground_window_context():
+    if sys.platform != "win32":
+        return {"title": "", "class": ""}
+
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return {"title": "", "class": ""}
+
+    title_len = user32.GetWindowTextLengthW(hwnd)
+    title_buf = ctypes.create_unicode_buffer(max(1, title_len + 1))
+    user32.GetWindowTextW(hwnd, title_buf, len(title_buf))
+
+    class_buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, class_buf, len(class_buf))
+
+    return {
+        "title": title_buf.value.strip(),
+        "class": class_buf.value.strip(),
+    }
+
+
 if sys.platform == "win32":
     ULONG_PTR_TYPE = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
     LRESULT_TYPE = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
@@ -130,7 +167,7 @@ class MouseRecorderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Mouse Recorder")
-        self.root.geometry("420x300")
+        self.root.geometry("420x360")
         self.root.resizable(False, False)
 
         self.is_recording = False
@@ -150,8 +187,11 @@ class MouseRecorderApp:
         self.stop_replay_requested = threading.Event()
         self.last_scroll_time = 0.0
         self.last_scroll_signature = None
-        self.recording_file = Path(__file__).with_name("last_recording.json")
+        self.app_data_dir = get_app_data_dir()
+        self.recording_file = self.app_data_dir / "last_recording.json"
         self.replay_count_var = tk.StringVar(value="1")
+        self.smart_replay_var = tk.BooleanVar(value=True)
+        self.smart_wait_timeout_var = tk.StringVar(value="8")
 
         self.status_var = tk.StringVar(value="Ready")
 
@@ -217,6 +257,34 @@ class MouseRecorderApp:
         )
         self.replay_count_spinbox.pack(side="left")
 
+        smart_row = tk.Frame(wrapper)
+        smart_row.pack(pady=(4, 6))
+        self.smart_replay_check = tk.Checkbutton(
+            smart_row,
+            text="Smart Replay",
+            variable=self.smart_replay_var,
+            onvalue=True,
+            offvalue=False,
+            font=("Segoe UI", 10),
+        )
+        self.smart_replay_check.pack(side="left", padx=(0, 12))
+        smart_timeout_label = tk.Label(
+            smart_row,
+            text="Wait (s):",
+            font=("Segoe UI", 10),
+        )
+        smart_timeout_label.pack(side="left", padx=(0, 6))
+        self.smart_wait_spinbox = tk.Spinbox(
+            smart_row,
+            from_=1,
+            to=60,
+            width=6,
+            textvariable=self.smart_wait_timeout_var,
+            justify="center",
+            font=("Segoe UI", 10),
+        )
+        self.smart_wait_spinbox.pack(side="left")
+
         status_label = tk.Label(
             wrapper,
             textvariable=self.status_var,
@@ -242,15 +310,104 @@ class MouseRecorderApp:
             self.stop_btn.config(state="normal")
             self.replay_btn.config(state="disabled")
             self.replay_count_spinbox.config(state="disabled")
+            self.smart_replay_check.config(state="disabled")
+            self.smart_wait_spinbox.config(state="disabled")
         else:
             self.start_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
             self.replay_btn.config(state="normal")
             if not self.is_replaying:
                 self.replay_count_spinbox.config(state="normal")
+                self.smart_replay_check.config(state="normal")
+                self.smart_wait_spinbox.config(state="normal")
 
     def _timestamp(self) -> float:
         return time.perf_counter() - self.record_start_time
+
+    def _normalize_window_text(self, text: str) -> str:
+        return " ".join(text.lower().split())
+
+    def _capture_window_context(self):
+        context = get_foreground_window_context()
+        title = str(context.get("title", "")).strip()
+        class_name = str(context.get("class", "")).strip()
+        return {"title": title, "class": class_name}
+
+    def _attach_window_context(self, event: dict) -> dict:
+        if sys.platform != "win32":
+            return event
+        context = self._capture_window_context()
+        if context.get("title") or context.get("class"):
+            event["window"] = context
+        return event
+
+    def _window_context_matches(self, expected: dict, current: dict) -> bool:
+        expected_class = self._normalize_window_text(str(expected.get("class", "")))
+        current_class = self._normalize_window_text(str(current.get("class", "")))
+        if expected_class and current_class and expected_class != current_class:
+            return False
+
+        expected_title = self._normalize_window_text(str(expected.get("title", "")))
+        current_title = self._normalize_window_text(str(current.get("title", "")))
+        if expected_title:
+            if not current_title:
+                return False
+            if expected_title == current_title:
+                return True
+            if expected_title in current_title or current_title in expected_title:
+                return True
+            return False
+
+        return True
+
+    def _smart_replay_enabled(self) -> bool:
+        return bool(self.smart_replay_var.get()) and sys.platform == "win32"
+
+    def _get_smart_wait_timeout(self):
+        raw = self.smart_wait_timeout_var.get().strip()
+        try:
+            timeout_seconds = float(raw)
+        except ValueError:
+            messagebox.showerror("Invalid Smart Wait", "Smart wait must be a number in seconds.")
+            return None
+
+        if timeout_seconds <= 0:
+            messagebox.showerror("Invalid Smart Wait", "Smart wait must be greater than zero.")
+            return None
+
+        timeout_seconds = min(timeout_seconds, 120.0)
+        self.smart_wait_timeout_var.set(str(timeout_seconds).rstrip("0").rstrip("."))
+        return timeout_seconds
+
+    def _wait_for_event_window_context(
+        self,
+        event: dict,
+        timeout_seconds: float,
+        smart_enabled: bool,
+    ):
+        if not smart_enabled:
+            return True, ""
+
+        expected_context = event.get("window")
+        if not isinstance(expected_context, dict):
+            return True, ""
+
+        started_at = time.perf_counter()
+        while True:
+            if self._should_stop_replay():
+                return False, "Stopped by Esc"
+
+            current_context = self._capture_window_context()
+            if self._window_context_matches(expected_context, current_context):
+                return True, ""
+
+            if (time.perf_counter() - started_at) >= timeout_seconds:
+                expected_title = str(expected_context.get("title", "")).strip()
+                if expected_title:
+                    return False, f"Smart wait timeout on window: {expected_title[:60]}"
+                return False, "Smart wait timeout (window context mismatch)"
+
+            time.sleep(0.05)
 
     def _event_type_counts(self):
         counts = {"move": 0, "click": 0, "scroll": 0, "key": 0}
@@ -328,16 +485,15 @@ class MouseRecorderApp:
 
         self.last_scroll_time = t
         self.last_scroll_signature = sig
-        self.events.append(
-            {
-                "type": "scroll",
-                "time": t,
-                "x": int(x),
-                "y": int(y),
-                "dx": float(dx),
-                "dy": float(dy),
-            }
-        )
+        event = {
+            "type": "scroll",
+            "time": t,
+            "x": int(x),
+            "y": int(y),
+            "dx": float(dx),
+            "dy": float(dy),
+        }
+        self.events.append(self._attach_window_context(event))
 
     def _append_key_event(self, key, action: str) -> None:
         if not self.is_recording:
@@ -348,14 +504,13 @@ class MouseRecorderApp:
             return
 
         payload = self._serialize_key(key)
-        self.events.append(
-            {
-                "type": "key",
-                "time": self._timestamp(),
-                "action": action,
-                "key": payload,
-            }
-        )
+        event = {
+            "type": "key",
+            "time": self._timestamp(),
+            "action": action,
+            "key": payload,
+        }
+        self.events.append(self._attach_window_context(event))
 
     def _emit_scroll(self, step_x: int, step_y: int) -> None:
         if step_x == 0 and step_y == 0:
@@ -459,16 +614,15 @@ class MouseRecorderApp:
         def on_click(x, y, button, pressed):
             if not self.is_recording:
                 return
-            self.events.append(
-                {
-                    "type": "click",
-                    "time": self._timestamp(),
-                    "x": int(x),
-                    "y": int(y),
-                    "button": button.name,
-                    "pressed": bool(pressed),
-                }
-            )
+            event = {
+                "type": "click",
+                "time": self._timestamp(),
+                "x": int(x),
+                "y": int(y),
+                "button": button.name,
+                "pressed": bool(pressed),
+            }
+            self.events.append(self._attach_window_context(event))
 
         def on_scroll(x, y, dx, dy):
             self._append_scroll_event(x, y, dx, dy)
@@ -542,6 +696,12 @@ class MouseRecorderApp:
         replay_count = self._get_replay_count()
         if replay_count is None:
             return
+        smart_replay_enabled = self._smart_replay_enabled()
+        smart_wait_timeout = 0.0
+        if smart_replay_enabled:
+            smart_wait_timeout = self._get_smart_wait_timeout()
+            if smart_wait_timeout is None:
+                return
 
         self.is_replaying = True
         self.stop_replay_requested.clear()
@@ -549,11 +709,14 @@ class MouseRecorderApp:
         self.stop_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
         self.replay_count_spinbox.config(state="disabled")
+        self.smart_replay_check.config(state="disabled")
+        self.smart_wait_spinbox.config(state="disabled")
         self.status_var.set(f"Replaying 1/{replay_count}... Press Esc to stop")
 
         def run_replay():
             replay_events = sorted(self.events, key=lambda item: float(item.get("time", 0.0)))
             replay_stopped = False
+            replay_stop_reason = ""
             replay_scroll_events = 0
             replay_key_events = 0
             completed_loops = 0
@@ -590,6 +753,17 @@ class MouseRecorderApp:
                         break
 
                     etype = event.get("type")
+                    if etype in ("click", "scroll", "key"):
+                        ready, reason = self._wait_for_event_window_context(
+                            event,
+                            smart_wait_timeout,
+                            smart_replay_enabled,
+                        )
+                        if not ready:
+                            replay_stopped = True
+                            replay_stop_reason = reason
+                            break
+
                     if etype == "move":
                         self.mouse_controller.position = (int(event["x"]), int(event["y"]))
                     elif etype == "click":
@@ -681,6 +855,7 @@ class MouseRecorderApp:
                     replay_stopped,
                     completed_loops,
                     replay_count,
+                    replay_stop_reason,
                 ),
             )
 
@@ -693,15 +868,18 @@ class MouseRecorderApp:
         replay_stopped: bool = False,
         completed_loops: int = 0,
         replay_count: int = 1,
+        replay_stop_reason: str = "",
     ) -> None:
         self.is_replaying = False
         self._set_recording_ui(False)
         if replay_stopped:
+            reason_suffix = f" | Reason: {replay_stop_reason}" if replay_stop_reason else ""
             self.status_var.set(
-                "Replay stopped by Esc | "
+                "Replay stopped | "
                 f"Loops: {completed_loops}/{replay_count} | "
                 f"Scroll replayed: {replay_scroll_events} | "
                 f"Keys replayed: {replay_key_events}"
+                f"{reason_suffix}"
             )
             return
         self.status_var.set(

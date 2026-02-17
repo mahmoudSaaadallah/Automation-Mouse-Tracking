@@ -19,17 +19,30 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Build Windows EXE (no Python needed for end users)
+
+```powershell
+.\build_windows.ps1
+```
+
+After build, send/share only:
+
+- `dist\MouseTrackerReplay.exe`
+
 ## Usage
 
 1. Click `Start Recording`.
 2. Move the mouse, click/scroll, and use the keyboard.
 3. Press `Esc` to stop recording.
 4. Set `Replay Count` to the number of loops you want.
-5. Click `Replay Last Recording` to run the same mouse + keyboard actions automatically.
-6. Press `Esc` during replay to stop replay immediately.
+5. Keep `Smart Replay` enabled for safer replay (recommended).
+6. Set `Wait (s)` to how long replay should wait for the expected app/window before each key/click/scroll event.
+7. Click `Replay Last Recording` to run the same mouse + keyboard actions automatically.
+8. Press `Esc` during replay to stop replay immediately.
 
 ## Notes
 
-- The app saves the latest recording to `last_recording.json`.
+- The app saves the latest recording in `%LOCALAPPDATA%\MouseTrackerReplay\last_recording.json`.
 - The last saved recording is loaded automatically on startup.
 - During replay, the app controls both mouse and keyboard according to the recorded events.
+- In `Smart Replay`, every key/click/scroll event waits for matching window context (title/class) before executing.
