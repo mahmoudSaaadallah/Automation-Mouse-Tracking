@@ -10,6 +10,11 @@ from tkinter import messagebox
 from pynput import keyboard, mouse
 
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+
 def enable_windows_dpi_awareness() -> None:
     if sys.platform != "win32":
         return
@@ -24,6 +29,100 @@ def enable_windows_dpi_awareness() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+if sys.platform == "win32":
+    ULONG_PTR_TYPE = getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
+    LRESULT_TYPE = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+    WPARAM_TYPE = getattr(wintypes, "WPARAM", ctypes.c_size_t)
+    LPARAM_TYPE = getattr(wintypes, "LPARAM", ctypes.c_ssize_t)
+    MOUSEEVENTF_WHEEL = 0x0800
+    MOUSEEVENTF_HWHEEL = 0x01000
+    WHEEL_DELTA = 120
+
+    class WindowsWheelHook:
+        WH_MOUSE_LL = 14
+        WM_MOUSEWHEEL = 0x020A
+        WM_MOUSEHWHEEL = 0x020E
+        WM_QUIT = 0x0012
+        HC_ACTION = 0
+
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("pt", wintypes.POINT),
+                ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ULONG_PTR_TYPE),
+            ]
+
+        LowLevelMouseProc = ctypes.WINFUNCTYPE(
+            LRESULT_TYPE,
+            ctypes.c_int,
+            WPARAM_TYPE,
+            LPARAM_TYPE,
+        )
+
+        def __init__(self, on_scroll_callback):
+            self.on_scroll_callback = on_scroll_callback
+            self.user32 = ctypes.windll.user32
+            self.kernel32 = ctypes.windll.kernel32
+            self._hook = None
+            self._proc = None
+            self._thread = None
+            self._thread_id = None
+            self._started = threading.Event()
+
+        def _low_level_proc(self, n_code, w_param, l_param):
+            if n_code == self.HC_ACTION and w_param in (self.WM_MOUSEWHEEL, self.WM_MOUSEHWHEEL):
+                info = ctypes.cast(l_param, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
+                delta = ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value
+                step = delta / 120.0
+                if w_param == self.WM_MOUSEWHEEL:
+                    self.on_scroll_callback(int(info.pt.x), int(info.pt.y), 0.0, float(step))
+                else:
+                    self.on_scroll_callback(int(info.pt.x), int(info.pt.y), float(step), 0.0)
+
+            return self.user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
+
+        def _run(self):
+            self._thread_id = self.kernel32.GetCurrentThreadId()
+            self._proc = self.LowLevelMouseProc(self._low_level_proc)
+            module = self.kernel32.GetModuleHandleW(None)
+            self._hook = self.user32.SetWindowsHookExW(
+                self.WH_MOUSE_LL,
+                self._proc,
+                module,
+                0,
+            )
+            self._started.set()
+            if not self._hook:
+                return
+
+            msg = wintypes.MSG()
+            while self.user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+                self.user32.TranslateMessage(ctypes.byref(msg))
+                self.user32.DispatchMessageW(ctypes.byref(msg))
+
+            self.user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+
+        def start(self):
+            if self._thread and self._thread.is_alive():
+                return
+            self._started.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            self._started.wait(timeout=1.0)
+
+        def stop(self):
+            if not self._thread:
+                return
+            if self._thread_id:
+                self.user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
+            self._thread.join(timeout=1.0)
+            self._thread = None
+            self._thread_id = None
 
 
 class MouseRecorderApp:
@@ -43,6 +142,9 @@ class MouseRecorderApp:
         self.mouse_listener = None
         self.keyboard_listener = None
         self.mouse_controller = mouse.Controller()
+        self.wheel_hook = None
+        self.last_scroll_time = 0.0
+        self.last_scroll_signature = None
         self.recording_file = Path(__file__).with_name("last_recording.json")
 
         self.status_var = tk.StringVar(value="Ready")
@@ -121,6 +223,14 @@ class MouseRecorderApp:
     def _timestamp(self) -> float:
         return time.perf_counter() - self.record_start_time
 
+    def _event_type_counts(self):
+        counts = {"move": 0, "click": 0, "scroll": 0}
+        for event in self.events:
+            event_type = event.get("type")
+            if event_type in counts:
+                counts[event_type] += 1
+        return counts
+
     def _append_move_event(
         self,
         x: int,
@@ -146,6 +256,54 @@ class MouseRecorderApp:
             }
         )
 
+    def _append_scroll_event(self, x: int, y: int, dx: float, dy: float) -> None:
+        if not self.is_recording:
+            return
+
+        t = self._timestamp()
+        sig = (int(x), int(y), round(float(dx), 4), round(float(dy), 4))
+        if self.last_scroll_signature == sig and (t - self.last_scroll_time) < 0.003:
+            return
+
+        self.last_scroll_time = t
+        self.last_scroll_signature = sig
+        self.events.append(
+            {
+                "type": "scroll",
+                "time": t,
+                "x": int(x),
+                "y": int(y),
+                "dx": float(dx),
+                "dy": float(dy),
+            }
+        )
+
+    def _emit_scroll(self, step_x: int, step_y: int) -> None:
+        if step_x == 0 and step_y == 0:
+            return
+
+        if sys.platform == "win32":
+            user32 = ctypes.windll.user32
+            if step_y != 0:
+                user32.mouse_event(
+                    MOUSEEVENTF_WHEEL,
+                    0,
+                    0,
+                    int(step_y * WHEEL_DELTA),
+                    0,
+                )
+            if step_x != 0:
+                user32.mouse_event(
+                    MOUSEEVENTF_HWHEEL,
+                    0,
+                    0,
+                    int(step_x * WHEEL_DELTA),
+                    0,
+                )
+            return
+
+        self.mouse_controller.scroll(step_x, step_y)
+
     def _start_keyboard_listener(self) -> None:
         def on_press(key):
             if key == keyboard.Key.esc and self.is_recording:
@@ -163,6 +321,8 @@ class MouseRecorderApp:
         self.record_start_time = time.perf_counter()
         self.last_move_time = 0.0
         self.last_recorded_pos = None
+        self.last_scroll_time = 0.0
+        self.last_scroll_signature = None
         self.is_recording = True
         self.status_var.set("Recording... move/click/scroll then press Esc")
         self._set_recording_ui(True)
@@ -190,18 +350,7 @@ class MouseRecorderApp:
             )
 
         def on_scroll(x, y, dx, dy):
-            if not self.is_recording:
-                return
-            self.events.append(
-                {
-                    "type": "scroll",
-                    "time": self._timestamp(),
-                    "x": int(x),
-                    "y": int(y),
-                    "dx": float(dx),
-                    "dy": float(dy),
-                }
-            )
+            self._append_scroll_event(x, y, dx, dy)
 
         self.mouse_listener = mouse.Listener(
             on_move=on_move,
@@ -210,6 +359,9 @@ class MouseRecorderApp:
         )
         self.mouse_listener.daemon = True
         self.mouse_listener.start()
+        if sys.platform == "win32":
+            self.wheel_hook = WindowsWheelHook(on_scroll)
+            self.wheel_hook.start()
 
     def stop_recording(self) -> None:
         if not self.is_recording:
@@ -222,12 +374,22 @@ class MouseRecorderApp:
         if self.mouse_listener:
             self.mouse_listener.stop()
             self.mouse_listener = None
+        if self.wheel_hook:
+            self.wheel_hook.stop()
+            self.wheel_hook = None
 
         if self.events:
             self._save_last_recording()
 
         self._set_recording_ui(False)
-        self.status_var.set(f"Stopped. Captured {len(self.events)} events")
+        counts = self._event_type_counts()
+        self.status_var.set(
+            "Stopped. "
+            f"Total {len(self.events)} | "
+            f"Move {counts['move']} | "
+            f"Click {counts['click']} | "
+            f"Scroll {counts['scroll']}"
+        )
 
     def replay_last_recording(self) -> None:
         if self.is_recording:
@@ -247,6 +409,7 @@ class MouseRecorderApp:
             replay_start = time.perf_counter()
             scroll_x_remainder = 0.0
             scroll_y_remainder = 0.0
+            replay_scroll_events = 0
             for event in replay_events:
                 target_time = float(event.get("time", 0.0))
                 while True:
@@ -268,28 +431,36 @@ class MouseRecorderApp:
                         else:
                             self.mouse_controller.release(btn)
                 elif etype == "scroll":
+                    replay_scroll_events += 1
                     self.mouse_controller.position = (int(event["x"]), int(event["y"]))
                     scroll_x_remainder += float(event.get("dx", 0.0))
                     scroll_y_remainder += float(event.get("dy", 0.0))
                     scroll_x = math.trunc(scroll_x_remainder)
                     scroll_y = math.trunc(scroll_y_remainder)
                     if scroll_x != 0 or scroll_y != 0:
-                        self.mouse_controller.scroll(scroll_x, scroll_y)
+                        self._emit_scroll(scroll_x, scroll_y)
                         scroll_x_remainder -= scroll_x
                         scroll_y_remainder -= scroll_y
+
+            # Flush residual fractional scroll at end so tiny touchpad deltas
+            # still produce a final visible scroll step.
+            final_x = int(round(scroll_x_remainder))
+            final_y = int(round(scroll_y_remainder))
+            if final_x != 0 or final_y != 0:
+                self._emit_scroll(final_x, final_y)
 
             if replay_events:
                 last = replay_events[-1]
                 if "x" in last and "y" in last:
                     self.mouse_controller.position = (int(last["x"]), int(last["y"]))
 
-            self.root.after(0, self._on_replay_done)
+            self.root.after(0, lambda: self._on_replay_done(replay_scroll_events))
 
         threading.Thread(target=run_replay, daemon=True).start()
 
-    def _on_replay_done(self) -> None:
+    def _on_replay_done(self, replay_scroll_events: int = 0) -> None:
         self._set_recording_ui(False)
-        self.status_var.set("Replay finished")
+        self.status_var.set(f"Replay finished | Scroll events replayed: {replay_scroll_events}")
 
     def _save_last_recording(self) -> None:
         try:
@@ -327,6 +498,9 @@ class MouseRecorderApp:
         if self.keyboard_listener:
             self.keyboard_listener.stop()
             self.keyboard_listener = None
+        if self.wheel_hook:
+            self.wheel_hook.stop()
+            self.wheel_hook = None
         self.root.destroy()
 
 
