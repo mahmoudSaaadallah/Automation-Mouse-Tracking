@@ -1,4 +1,6 @@
 import json
+import math
+import sys
 import threading
 import time
 import tkinter as tk
@@ -6,6 +8,22 @@ from pathlib import Path
 from tkinter import messagebox
 
 from pynput import keyboard, mouse
+
+
+def enable_windows_dpi_awareness() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 class MouseRecorderApp:
@@ -19,7 +37,8 @@ class MouseRecorderApp:
         self.events = []
         self.record_start_time = None
         self.last_move_time = 0.0
-        self.min_move_interval = 0.01  # 10ms
+        self.min_move_interval = 0.003  # 3ms for better path accuracy
+        self.last_recorded_pos = None
 
         self.mouse_listener = None
         self.keyboard_listener = None
@@ -102,6 +121,31 @@ class MouseRecorderApp:
     def _timestamp(self) -> float:
         return time.perf_counter() - self.record_start_time
 
+    def _append_move_event(
+        self,
+        x: int,
+        y: int,
+        timestamp: float,
+        force: bool = False,
+    ) -> None:
+        if not force and (timestamp - self.last_move_time) < self.min_move_interval:
+            return
+
+        pos = (int(x), int(y))
+        if not force and self.last_recorded_pos == pos:
+            return
+
+        self.last_move_time = timestamp
+        self.last_recorded_pos = pos
+        self.events.append(
+            {
+                "type": "move",
+                "time": timestamp,
+                "x": pos[0],
+                "y": pos[1],
+            }
+        )
+
     def _start_keyboard_listener(self) -> None:
         def on_press(key):
             if key == keyboard.Key.esc and self.is_recording:
@@ -118,25 +162,18 @@ class MouseRecorderApp:
         self.events = []
         self.record_start_time = time.perf_counter()
         self.last_move_time = 0.0
+        self.last_recorded_pos = None
         self.is_recording = True
         self.status_var.set("Recording... move/click/scroll then press Esc")
         self._set_recording_ui(True)
 
+        start_x, start_y = self.mouse_controller.position
+        self._append_move_event(start_x, start_y, 0.0, force=True)
+
         def on_move(x, y):
             if not self.is_recording:
                 return
-            t = self._timestamp()
-            if (t - self.last_move_time) < self.min_move_interval:
-                return
-            self.last_move_time = t
-            self.events.append(
-                {
-                    "type": "move",
-                    "time": t,
-                    "x": int(x),
-                    "y": int(y),
-                }
-            )
+            self._append_move_event(x, y, self._timestamp())
 
         def on_click(x, y, button, pressed):
             if not self.is_recording:
@@ -161,8 +198,8 @@ class MouseRecorderApp:
                     "time": self._timestamp(),
                     "x": int(x),
                     "y": int(y),
-                    "dx": int(dx),
-                    "dy": int(dy),
+                    "dx": float(dx),
+                    "dy": float(dy),
                 }
             )
 
@@ -177,6 +214,9 @@ class MouseRecorderApp:
     def stop_recording(self) -> None:
         if not self.is_recording:
             return
+
+        end_x, end_y = self.mouse_controller.position
+        self._append_move_event(end_x, end_y, self._timestamp(), force=True)
 
         self.is_recording = False
         if self.mouse_listener:
@@ -203,9 +243,12 @@ class MouseRecorderApp:
         self.status_var.set("Replaying...")
 
         def run_replay():
+            replay_events = sorted(self.events, key=lambda item: float(item.get("time", 0.0)))
             replay_start = time.perf_counter()
-            for event in self.events:
-                target_time = event["time"]
+            scroll_x_remainder = 0.0
+            scroll_y_remainder = 0.0
+            for event in replay_events:
+                target_time = float(event.get("time", 0.0))
                 while True:
                     elapsed = time.perf_counter() - replay_start
                     remaining = target_time - elapsed
@@ -213,11 +256,11 @@ class MouseRecorderApp:
                         break
                     time.sleep(min(remaining, 0.002))
 
-                etype = event["type"]
+                etype = event.get("type")
                 if etype == "move":
-                    self.mouse_controller.position = (event["x"], event["y"])
+                    self.mouse_controller.position = (int(event["x"]), int(event["y"]))
                 elif etype == "click":
-                    self.mouse_controller.position = (event["x"], event["y"])
+                    self.mouse_controller.position = (int(event["x"]), int(event["y"]))
                     btn = getattr(mouse.Button, event["button"], None)
                     if btn:
                         if event["pressed"]:
@@ -225,8 +268,20 @@ class MouseRecorderApp:
                         else:
                             self.mouse_controller.release(btn)
                 elif etype == "scroll":
-                    self.mouse_controller.position = (event["x"], event["y"])
-                    self.mouse_controller.scroll(event["dx"], event["dy"])
+                    self.mouse_controller.position = (int(event["x"]), int(event["y"]))
+                    scroll_x_remainder += float(event.get("dx", 0.0))
+                    scroll_y_remainder += float(event.get("dy", 0.0))
+                    scroll_x = math.trunc(scroll_x_remainder)
+                    scroll_y = math.trunc(scroll_y_remainder)
+                    if scroll_x != 0 or scroll_y != 0:
+                        self.mouse_controller.scroll(scroll_x, scroll_y)
+                        scroll_x_remainder -= scroll_x
+                        scroll_y_remainder -= scroll_y
+
+            if replay_events:
+                last = replay_events[-1]
+                if "x" in last and "y" in last:
+                    self.mouse_controller.position = (int(last["x"]), int(last["y"]))
 
             self.root.after(0, self._on_replay_done)
 
@@ -276,6 +331,7 @@ class MouseRecorderApp:
 
 
 def main() -> None:
+    enable_windows_dpi_awareness()
     root = tk.Tk()
     app = MouseRecorderApp(root)
     root.mainloop()
